@@ -1,0 +1,15 @@
+[Unit]
+Description=Set up USB gadget (usb0 network function) via configfs
+DefaultDependencies=no
+After=sys-kernel-config.mount
+Requires=sys-kernel-config.mount
+Before=network-pre.target networking.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/usb0-gadget-setup.sh
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Grow the root filesystem to the userdata partition
+ConditionFirstBoot=yes
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/a40-firstboot
+
+[Install]
+WantedBy=multi-user.target

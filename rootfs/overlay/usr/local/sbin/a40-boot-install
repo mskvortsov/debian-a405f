@@ -1,0 +1,39 @@
+#!/bin/sh
+# Install a kernel for U-Boot, which loads fixed names from /boot (see
+# /boot/boot.cmd): vmlinuz (uncompressed Image), initramfs and
+# dtbs/exynos/exynos7885-a40.dtb.
+#
+#   a40-boot-install VERSION
+#
+# Called by the kernel and initramfs hooks, so installing a linux-image
+# package makes it the one that boots. /boot/kernel-release records the
+# version in place.
+set -eu
+
+ver=$1
+img=/boot/vmlinuz-$ver
+initrd=/boot/initrd.img-$ver
+dtb=/usr/lib/linux-image-$ver/exynos/exynos7885-a40.dtb
+
+for f in "$img" "$initrd" "$dtb"; do
+    [ -e "$f" ] || { echo "a40-boot-install: $f missing, not installing $ver" >&2; exit 0; }
+done
+
+# Write to a temporary name and rename, so an interrupted install leaves
+# the previous kernel bootable. booti wants an uncompressed Image.
+if gzip -t "$img" 2>/dev/null; then
+    zcat "$img" > /boot/vmlinuz.new
+else
+    cp "$img" /boot/vmlinuz.new
+fi
+cp "$initrd" /boot/initramfs.new
+mkdir -p /boot/dtbs/exynos
+cp "$dtb" /boot/dtbs/exynos/exynos7885-a40.dtb.new
+sync
+
+mv /boot/vmlinuz.new /boot/vmlinuz
+mv /boot/initramfs.new /boot/initramfs
+mv /boot/dtbs/exynos/exynos7885-a40.dtb.new /boot/dtbs/exynos/exynos7885-a40.dtb
+echo "$ver" > /boot/kernel-release
+sync
+echo "a40-boot-install: U-Boot will boot $ver"

@@ -1,0 +1,8 @@
+#!/bin/sh
+# First boot: grow the root filesystem from the image's size to the
+# whole userdata partition.
+set -eu
+btrfs filesystem resize max /
+# U-Boot cannot read boot.scr if btrfs compresses it; mkimage rewrites the
+# file in place, so the property stays (see /boot/boot.cmd)
+btrfs property set /boot/boot.scr compression none

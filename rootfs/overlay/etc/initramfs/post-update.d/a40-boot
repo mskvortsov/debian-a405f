@@ -1,0 +1,5 @@
+#!/bin/sh
+# update-initramfs -u: refresh /boot/initramfs if it is the booting kernel's.
+# During a kernel install the kernel hook does that instead.
+[ "$(cat /boot/kernel-release 2>/dev/null)" = "$1" ] || exit 0
+exec /usr/local/sbin/a40-boot-install "$1"

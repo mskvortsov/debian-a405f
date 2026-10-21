@@ -1,0 +1,2 @@
+# Limit battery charge to reduce cell wear.
+ACTION=="add", SUBSYSTEM=="power_supply", KERNEL=="s2mu106-charger", ATTR{charge_control_limit}="75"

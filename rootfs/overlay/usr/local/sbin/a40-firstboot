@@ -1,0 +1,11 @@
+#!/bin/sh
+# First boot: grow the root filesystem from the image's size to the
+# whole userdata partition.
+set -eu
+# Only for this boot's preset (rootfs/setup.sh); left in place it would
+# also keep packages installed later from enabling their units
+rm -f /etc/systemd/system-preset/00-a40.preset
+btrfs filesystem resize max /
+# U-Boot cannot read boot.scr if btrfs compresses it; mkimage rewrites the
+# file in place, so the property stays (see /boot/boot.cmd)
+btrfs property set /boot/boot.scr compression none

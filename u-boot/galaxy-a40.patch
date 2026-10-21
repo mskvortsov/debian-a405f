@@ -1,0 +1,1486 @@
+From e5c171935a4f6fee0444ed7560edb6c1f031991e Mon Sep 17 00:00:00 2001
+From: Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
+Date: Wed, 21 Oct 2026 16:50:35 +0300
+Subject: [PATCH] board: samsung: exynos-mobile: Galaxy A40
+
+Add the Samsung Galaxy A40 (SM-A405F, Exynos 7885) to the
+exynos-mobile board, chain-loaded by S-Boot from the boot partition:
+
+- clk and pinctrl drivers for the Exynos 7885 blocks U-Boot uses, and
+  the device tree with its -u-boot.dtsi.
+- USB gadget (fastboot, USB mass storage): an Exynos 7885 variant of
+  the USB DRD PHY (its PMU isolation register, PHY_RST_SEL, the HS PHY
+  tune value from the downstream kernel) with matching dwc3 fixes. The
+  board code enables the USB PLL and FSYS clock gates, which S-Boot
+  leaves off, and routes D+/D- through the S2MU106 MUIC to USB.
+- dw_mmc: floor the data timeout at ~1 MB/s, since the controller clock
+  cannot be raised and the nominal-rate timeout is too short for large
+  transfers; the resulting set-rate failure is now debug output.
+- Boot by sourcing /boot/boot.scr from userdata (partition 0x20) rather
+  than sysboot/extlinux.conf, going straight to a bootmenu (boot,
+  fastboot, USB storage, reboot, power off) with a short delay.
+- CONFIG_CMD_BTRFS, so the root filesystem can be btrfs.
+---
+ .../arm/dts/exynos7885-galaxy-a40-u-boot.dtsi | 104 ++++++++
+ board/samsung/exynos-mobile/exynos-mobile.c   | 202 +++++++++++++++
+ board/samsung/exynos-mobile/exynos-mobile.env |  27 +-
+ configs/galaxy-a40_defconfig                  |  81 ++++++
+ drivers/clk/exynos/Kconfig                    |   8 +
+ drivers/clk/exynos/Makefile                   |   1 +
+ drivers/clk/exynos/clk-exynos7885.c           | 237 ++++++++++++++++++
+ drivers/mmc/dw_mmc.c                          |  16 +-
+ drivers/mmc/exynos_dw_mmc.c                   |   8 +-
+ drivers/phy/phy-exynos-usbdrd.c               | 185 +++++++++++++-
+ drivers/pinctrl/exynos/Kconfig                |   8 +
+ drivers/pinctrl/exynos/Makefile               |   1 +
+ drivers/pinctrl/exynos/pinctrl-exynos7885.c   | 112 +++++++++
+ drivers/usb/dwc3/core.c                       |   9 +
+ drivers/usb/dwc3/dwc3-generic.c               |   1 +
+ drivers/usb/dwc3/gadget.c                     |  14 ++
+ drivers/usb/gadget/g_dnl.c                    |   1 +
+ .../arm64/exynos/exynos7885-galaxy-a40.dts    | 138 ++++++++++
+ 18 files changed, 1133 insertions(+), 20 deletions(-)
+ create mode 100644 arch/arm/dts/exynos7885-galaxy-a40-u-boot.dtsi
+ create mode 100644 configs/galaxy-a40_defconfig
+ create mode 100644 drivers/clk/exynos/clk-exynos7885.c
+ create mode 100644 drivers/pinctrl/exynos/pinctrl-exynos7885.c
+ create mode 100644 dts/upstream/src/arm64/exynos/exynos7885-galaxy-a40.dts
+
+diff --git a/arch/arm/dts/exynos7885-galaxy-a40-u-boot.dtsi b/arch/arm/dts/exynos7885-galaxy-a40-u-boot.dtsi
+new file mode 100644
+index 00000000000..53e834bb12b
+--- /dev/null
++++ b/arch/arm/dts/exynos7885-galaxy-a40-u-boot.dtsi
+@@ -0,0 +1,104 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * A40-specific U-Boot overlay: properties S-BOOT looks at, and the
++ * framebuffer S-BOOT already set up (reused as the U-Boot console).
++ *
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ */
++
++/ {
++	/*
++	 * Required by S-BOOT on the 7870 phones. The A40's S-BOOT appears
++	 * lenient (our Linux chain-load boots with a DTB that omits these),
++	 * but set them best-effort. model_info-chip is a guess from the SoC
++	 * family - VERIFY on device; if S-BOOT rejects the image, this value
++	 * (or hw_rev range) is the first thing to fix.
++	 */
++	model_info-chip = <7885>;
++	model_info-hw_rev = <0>;
++	model_info-hw_rev_end = <255>;
++
++	chosen {
++		#address-cells = <2>;
++		#size-cells = <1>;
++		ranges;
++
++		/*
++		 * The simple-framebuffer S-BOOT leaves running on the A40
++		 * (0xec000000, 1080x2340, a8r8g8b8) - the same surface Linux
++		 * uses for the tty0 console. U-Boot's VIDEO_SIMPLE binds here
++		 * so U-Boot output lands on the screen without a UART jig.
++		 */
++		framebuffer@ec000000 {
++			compatible = "simple-framebuffer";
++			reg = <0x0 0xec000000 (1080 * 2340 * 4)>;
++			width = <1080>;
++			height = <2340>;
++			stride = <(1080 * 4)>;
++			format = "a8r8g8b8";
++		};
++	};
++};
++
++/*
++ * Only probe the ALIVE pinctrl instance. DISPAUD / FSYS / TOP pinctrl
++ * blocks sit in power domains that may not be clocked by the time U-Boot
++ * probes them, causing hangs. The key GPIOs (gpa1) and eMMC pins are all
++ * in the ALIVE domain so disabling the others has no functional cost.
++ */
++&pinctrl_dispaud { status = "disabled"; };
++&pinctrl_fsys { status = "disabled"; };
++&pinctrl_top { status = "disabled"; };
++
++/*
++ * eMMC (mmc_0): clocks come from cmu_fsys (CLK_GOUT_MMC_EMBD_ACLK /
++ * CLK_GOUT_MMC_EMBD_SDCLKIN) via the exynos7885 clock driver.
++ * S-BOOT already powered, muxed, and enabled the eMMC; we inherit that
++ * state and only need to set bus geometry and timing parameters.
++ */
++&mmc_0 {
++	bus-width = <8>;
++	samsung,dw-mshc-ciu-div = <3>;
++	samsung,dw-mshc-sdr-timing = <0 4>;
++	samsung,dw-mshc-ddr-timing = <2 4>;
++	mmc-hs200-1_8v;
++	non-removable;
++	status = "okay";
++};
++
++/*
++ * I2C1 (0x13840000) carries the S2MU005 MUIC at addr 0x3d.  We bring this
++ * bus up to inspect/control the MUIC's USB/UART data-path switch
++ * (SW_CTRL @0xB5): on this Type-C phone the USB2 D+/D- route through the
++ * MUIC, and if it is not in USB-path mode the host never sees the device
++ * no matter how the DWC3/PHY are configured.
++ *
++ * cmu_peri is not modelled in U-Boot's clock driver, but S-Boot leaves the
++ * I2C1 PCLK running (it uses the MUIC during boot).  Feed the s3c i2c
++ * driver a fixed input rate so it can compute the bus divider; 200 MHz is
++ * >= the real PERI_BUS rate, so the resulting SCL stays at/below the
++ * 100 kHz target (over-estimating only makes SCL slower, which is safe).
++ * The I2C1 pins (gpp1-2/3) sit in pinctrl_top, which we keep disabled, so
++ * drop the pinctrl reference and rely on S-Boot's pin muxing.
++ */
++/ {
++	i2c1_ipclk: clock-i2c1-ipclk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <200000000>;
++	};
++};
++
++&i2c_1 {
++	status = "okay";
++	clocks = <&i2c1_ipclk>;
++	clock-names = "i2c";
++	clock-frequency = <100000>;
++	/delete-property/ pinctrl-names;
++	/delete-property/ pinctrl-0;
++
++	s2mu005_muic: s2mu005@3d {
++		compatible = "samsung,s2mu005-muic";
++		reg = <0x3d>;
++	};
++};
+diff --git a/board/samsung/exynos-mobile/exynos-mobile.c b/board/samsung/exynos-mobile/exynos-mobile.c
+index 6b2b1523663..b52da27f530 100644
+--- a/board/samsung/exynos-mobile/exynos-mobile.c
++++ b/board/samsung/exynos-mobile/exynos-mobile.c
+@@ -6,20 +6,25 @@
+  */
+ 
+ #include <asm/armv8/mmu.h>
++#include <asm/io.h>
+ #include <blk.h>
+ #include <bootflow.h>
+ #include <ctype.h>
++#include <dm.h>
+ #include <dm/ofnode.h>
+ #include <efi.h>
++#include <i2c.h>
+ #include <efi_loader.h>
+ #include <env.h>
+ #include <errno.h>
+ #include <init.h>
++#include <linux/delay.h>
+ #include <linux/sizes.h>
+ #include <lmb.h>
+ #include <part.h>
+ #include <stdbool.h>
+ #include <string.h>
++#include <usb.h>
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+@@ -358,10 +363,207 @@ int board_init(void)
+ 	return 0;
+ }
+ 
++/*
++ * Samsung A40 USB-C data path: the USB2 D+/D- route through the if-PMIC
++ * MUIC's internal switch (I2C1 @0x13840000, addr 0x3d).  Linux sets the
++ * path in software on cable attach; U-Boot has no such driver, so it stays
++ * at whatever S-Boot left.  A40 is exynos7904, whose MUIC is an S2MU106
++ * (per exynos7904-m30lte: i2c@13840000/s2mu106@3d), though some 7885
++ * variants use S2MU005.  Both sit at 0x3d but differ in register map:
++ *
++ *   S2MU106: CTRL1=0x6d  MANUAL_SW_CTRL=0x70  (DM[7:5]/DP[4:2]/JIG[0])
++ *   S2MU005: CTRL1=0xB2  SW_CTRL=0xB5         (DM[7:5]/DP[4:2]/CHG[1]/OTG[0])
++ *
++ * USB path value is 0x24 (DM=001,DP=001) on both.  This first pass is
++ * diagnostic only: scan the bus to confirm it works and read both candidate
++ * switch regs read-only; no writes until we know the chip and the bus is
++ * proven alive (current symptom: read of 0x3d returns -121 EREMOTEIO).
++ */
++#define A40_MUIC_I2C_PATH	"/soc@0/i2c@13840000"
++#define A40_MUIC_ADDR		0x3d
++/* S2MU106 MUIC registers (this phone is exynos7904 / S2MU106, not S2MU005). */
++#define A40_MUIC_CTRL1		0x6d	/* bit2 MANUAL_SW: 0=manual 1=auto */
++#define A40_MUIC_MANSW		0x70	/* D-[7:5]/D+[4:2] path select */
++#define A40_MUIC_MANSW_USB	0x24	/* (USB<<5)|(USB<<2), USB=001 */
++/*
++ * Clean manual-mode CTRL1: SWITCH_OPEN(b4) | WAIT(b1), MANUAL_SW(b2)=0 => manual.
++ * Matches the downstream s2mu106 driver's reg_init value (0x12).  S-Boot leaves
++ * CTRL1=0x99 with TX_DPDM_SHORT(b7) and RAW_DATA(b3) set, which short/route the
++ * lines for charger detection instead of passing clean USB - clear them.
++ */
++#define A40_MUIC_CTRL1_MANUAL	0x12
++
++/*
++ * The I2C1 pins (gpp1-2 = SDA, gpp1-3 = SCL) live in pinctrl_top, which we keep
++ * disabled (its power domain can hang U-Boot at probe), so the pinctrl driver
++ * never muxes them and S-Boot apparently left them in a non-I2C function -
++ * the bus scan returns 0 devices (SDA/SCL float).  Program the gpp1 CON
++ * register directly to put both pins in function 2 (I2C1) before any transfer.
++ *
++ *   pinctrl_top base   0x139b0000
++ *   gpp1 bank offset   0x040  -> CON at 0x139b0040
++ *   pin field          4 bits each; pin2 = bits[11:8], pin3 = bits[15:12]
++ *   I2C1 function      2
++ * Board I2C pull-ups keep SDA/SCL high, so muxing CON is sufficient.
++ */
++#define A40_GPP1_CON		0x139b0040
++
++/*
++ * USB PHY / DRD clock gates in CMU_FSYS (base 0x13400000).  The PHY's UTMI
++ * analogue reference is CLK_FSYS_USB20PHY_CLKCORE - but the DT wires the PHY
++ * driver's "ref" clock to a fixed-clock shim (for FSEL detection), so the
++ * driver's clk_prepare_enable() is a no-op and this real gate is referenced by
++ * nothing.  S-Boot never used USB, so it may have left these gated off, leaving
++ * the PHY PLL without a reference (never locks -> link stuck Disconnected).
++ * Read them back (diagnostic) and force them on before USB bring-up.  bit21 = en.
++ */
++#define A40_CMU_FSYS_BASE		0x13400000
++/*
++ * USB PLL (PLL_USB / PLL_OUT_USB).  The downstream PHY DT wires the PHY refclk
++ * ("phy_refclk = out_usb") to this PLL's output; the working driver enables it.
++ * U-Boot doesn't model it, so nobody locks it - and if S-Boot never used USB it
++ * may be disabled, leaving the HS PHY without a reference (PLL never locks ->
++ * link permanently Disconnected, zero events - exactly our symptom).
++ * CON0 @ CMU_FSYS+0x1a0: bit31 ENABLE, bit29 STABLE(lock), M[25:16] P[13:8] S[2:0].
++ */
++#define A40_PLL_LOCKTIME_PLL_USB	(A40_CMU_FSYS_BASE + 0x0000)
++#define A40_PLL_CON0_PLL_USB		(A40_CMU_FSYS_BASE + 0x01a0)
++#define A40_PLL_USB_ENABLE		BIT(31)
++#define A40_PLL_USB_STABLE		BIT(29)
++#define A40_PLL_USB_MUX_SEL		BIT(4)	/* route PLL output, not bypass */
++/* PLL_USB target 50 MHz from 26 MHz OSC: M=400 P=13 S=4 (downstream pms table). */
++#define A40_PLL_USB_M			400
++#define A40_PLL_USB_P			13
++#define A40_PLL_USB_S			4
++#define A40_GAT_USB20PHY_CLKCORE	(A40_CMU_FSYS_BASE + 0x200c)
++#define A40_GAT_USB30DRD_ACLK_20PHYCTRL	(A40_CMU_FSYS_BASE + 0x2068)
++#define A40_GAT_USB30DRD_BUS_CLK_EARLY	(A40_CMU_FSYS_BASE + 0x2074)
++#define A40_GAT_USB30DRD_REF_CLK	(A40_CMU_FSYS_BASE + 0x2078)
++#define A40_CMU_GATE_EN			BIT(21)
++
++static void a40_enable_usb_pll(void)
++{
++	u32 con0 = readl(A40_PLL_CON0_PLL_USB);
++	u32 val;
++	int i;
++
++	/* Already enabled, locked and at the right ratio?  Leave it alone. */
++	if ((con0 & A40_PLL_USB_ENABLE) && (con0 & A40_PLL_USB_STABLE) &&
++	    ((con0 >> 16) & 0x3ff) == A40_PLL_USB_M)
++		return;
++
++	/*
++	 * S-Boot never used USB, so PLL_USB is completely unconfigured (CON0=0).
++	 * Program lock time (PDIV * 150, the pll_1418x convention), then the
++	 * dividers + MUX_SEL + ENABLE, and wait for the STABLE (lock) bit.
++	 */
++	writel(A40_PLL_USB_P * 150, A40_PLL_LOCKTIME_PLL_USB);
++
++	val = A40_PLL_USB_ENABLE | A40_PLL_USB_MUX_SEL |
++	      (A40_PLL_USB_M << 16) | (A40_PLL_USB_P << 8) | A40_PLL_USB_S;
++	writel(val, A40_PLL_CON0_PLL_USB);
++
++	for (i = 0; i < 10000; i++) {
++		if (readl(A40_PLL_CON0_PLL_USB) & A40_PLL_USB_STABLE)
++			break;
++		udelay(1);
++	}
++}
++
++static void a40_enable_usb_phy_clocks(void)
++{
++	const u32 gates[] = {
++		A40_GAT_USB20PHY_CLKCORE,
++		A40_GAT_USB30DRD_ACLK_20PHYCTRL,
++		A40_GAT_USB30DRD_BUS_CLK_EARLY,
++		A40_GAT_USB30DRD_REF_CLK,
++	};
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(gates); i++)
++		writel(readl(gates[i]) | A40_CMU_GATE_EN, gates[i]);
++}
++
++static void a40_mux_i2c1_pins(void)
++{
++	u32 con = readl(A40_GPP1_CON);
++
++	con &= ~0x0000ff00;			/* clear pin2 + pin3 fields */
++	con |=  0x00002200;			/* pin2=func2, pin3=func2  */
++	writel(con, A40_GPP1_CON);
++}
++
++static void a40_muic_force_usb_path(void)
++{
++	struct udevice *bus, *dev;
++	ofnode node;
++	int ret;
++	u8 v;
++
++	a40_mux_i2c1_pins();
++
++	node = ofnode_path(A40_MUIC_I2C_PATH);
++	if (!ofnode_valid(node))
++		return;
++	if (uclass_get_device_by_ofnode(UCLASS_I2C, node, &bus))
++		return;
++	if (i2c_get_chip(bus, A40_MUIC_ADDR, 1, &dev))
++		return;
++
++	/*
++	 * S2MU106 data-path switch.  S-Boot leaves CTRL1=0x99 (RAW_DATA /
++	 * TX_DPDM_SHORT, charger-detect) and a split MANSW (D- on UART), so the
++	 * host can't enumerate.  Put CTRL1 in clean manual mode and route both
++	 * D+/D- to USB:
++	 *   CTRL1(0x6d): SWITCH_OPEN|WAIT, MANUAL_SW=0 (manual)        => 0x12
++	 *   MANSW(0x70): D-[7:5]/D+[4:2] = USB(001) each, keep [1:0]   => (old&3)|0x24
++	 */
++	v = A40_MUIC_CTRL1_MANUAL;
++	dm_i2c_write(dev, A40_MUIC_CTRL1, &v, 1);
++
++	ret = dm_i2c_read(dev, A40_MUIC_MANSW, &v, 1);
++	if (ret)
++		return;
++	v = (v & 0x03) | A40_MUIC_MANSW_USB;
++	dm_i2c_write(dev, A40_MUIC_MANSW, &v, 1);
++}
++
++/*
++ * Board hook called from the fastboot/g_dnl path (cmd/fastboot.c) after the
++ * UDC is probed and before the enumeration loop.  The DM_USB_GADGET path
++ * never calls board_usb_init(), so this is the spot that actually runs (and
++ * prints) during 'fastboot usb 0'.  Use it to route the MUIC to USB; always
++ * report the cable as present so fastboot proceeds.
++ */
++int g_dnl_board_usb_cable_connected(void)
++{
++	a40_muic_force_usb_path();
++
++	return 1;
++}
++
+ int misc_init_r(void)
+ {
+ 	int ret;
+ 
++	/*
++	 * Push our debug output below the display's rounded corners / camera
++	 * cutout so the top lines aren't clipped in screen photos.
++	 */
++	puts("\n\n\n");
++
++	/*
++	 * Route the MUIC data-path switch to USB *before* any USB bring-up.
++	 * The fastboot path asserts the D+ pullup (RUNSTOP) in g_dnl_register,
++	 * which happens before the g_dnl_board_usb_cable_connected() hook, so
++	 * fixing the path only in that hook is too late - the host already saw a
++	 * malformed connect (D+ up, D- on UART) and stops retrying.  Doing it
++	 * here means the very first connect the host sees has both D+/D- on USB.
++	 */
++	a40_enable_usb_pll();
++	a40_enable_usb_phy_clocks();
++	a40_muic_force_usb_path();
++
+ 	exynos_env_setup();
+ 
+ 	ret = exynos_blk_env_setup();
+diff --git a/board/samsung/exynos-mobile/exynos-mobile.env b/board/samsung/exynos-mobile/exynos-mobile.env
+index 33f767319b5..504f4141614 100644
+--- a/board/samsung/exynos-mobile/exynos-mobile.env
++++ b/board/samsung/exynos-mobile/exynos-mobile.env
+@@ -2,22 +2,27 @@ stdin=serial,button-kbd
+ stdout=serial,vidconsole
+ stderr=serial,vidconsole
+ 
+-blkmapcmd=blkmap create root;
+-	  blkmap map root 0 ${blkmap_size_r} linear ${blkmap_blk_ifname} ${blkmap_blk_dev} ${blkmap_blk_nr}
++bootdelay=0
++bootcmd=bootmenu
+ 
+-preboot=run blkmapcmd
++bootmenu_delay=2
+ 
+-bootdelay=0
+-bootcmd=bootefi bootmgr; pause; bootmenu
++bootscrcmd=if load mmc 0:0x20 ${scriptaddr} /boot/boot.scr; then
++	source ${scriptaddr}; else bootmenu; fi
++
++scriptaddr=0x90000000
++kernel_addr_r=0x80000000
++ramdisk_addr_r=0x88000000
++fdt_addr_r=0x8a000000
+ 
+ fastbootcmd=echo "Fastboot Mode";
+-	fastboot -l $fastboot_addr_r usb 0
++	fastboot usb 0
+ 
+-bootmenu_0=Continue Boot=boot
++umscmd=echo "USB Storage Mode";
++	ums 0 mmc 0; reset
++
++bootmenu_0=Boot Linux=run bootscrcmd
+ bootmenu_1=Enter Fastboot Mode=run fastbootcmd
+-bootmenu_2=UEFI Maintenance Menu=eficonfig
++bootmenu_2=USB Storage (eMMC)=run umscmd
+ bootmenu_3=Reboot=reset
+ bootmenu_4=Power Off=poweroff
+-
+-button_cmd_0_name=Volume Down Key
+-button_cmd_0=bootmenu
+diff --git a/configs/galaxy-a40_defconfig b/configs/galaxy-a40_defconfig
+new file mode 100644
+index 00000000000..dfcc44ce2d9
+--- /dev/null
++++ b/configs/galaxy-a40_defconfig
+@@ -0,0 +1,81 @@
++CONFIG_ARM=y
++CONFIG_SKIP_LOWLEVEL_INIT=y
++CONFIG_COUNTER_FREQUENCY=26000000
++CONFIG_POSITION_INDEPENDENT=y
++CONFIG_ARCH_EXYNOS=y
++CONFIG_SYS_MALLOC_LEN=0x2000000
++CONFIG_SYS_MALLOC_F_LEN=0x16000
++CONFIG_TARGET_EXYNOS_MOBILE=y
++CONFIG_NR_DRAM_BANKS=3
++CONFIG_DEFAULT_DEVICE_TREE="exynos/exynos7885-galaxy-a40"
++CONFIG_SYS_BOOTM_LEN=0x2000000
++CONFIG_SYS_LOAD_ADDR=0x80000000
++CONFIG_ARMV8_CNTFRQ_BROKEN=y
++# CONFIG_PSCI_RESET is not set
++# CONFIG_TOOLS_MKEFICAPSULE is not set
++# CONFIG_REQUIRE_SERIAL_CONSOLE is not set
++CONFIG_BUTTON_CMD=y
++CONFIG_USE_PREBOOT=y
++CONFIG_SAVE_PREV_BL_FDT_ADDR=y
++CONFIG_SAVE_PREV_BL_INITRAMFS_START_ADDR=y
++CONFIG_SYS_PBSIZE=1024
++CONFIG_BOARD_TYPES=y
++# CONFIG_DISPLAY_CPUINFO is not set
++CONFIG_MISC_INIT_R=y
++CONFIG_HUSH_PARSER=y
++CONFIG_CMD_BOOTMENU=y
++CONFIG_CMD_POWEROFF=y
++CONFIG_CMD_I2C=y
++CONFIG_CMD_FS_GENERIC=y
++CONFIG_CMD_BTRFS=y
++CONFIG_EFI_PARTITION=y
++CONFIG_OF_UPSTREAM=y
++CONFIG_OF_UPSTREAM_BUILD_VENDOR=y
++CONFIG_OF_BOARD=y
++CONFIG_BLKMAP=y
++CONFIG_BUTTON_REMAP_PHONE_KEYS=y
++CONFIG_CLK_EXYNOS7885=y
++CONFIG_DFU_MMC=y
++CONFIG_SYS_DFU_DATA_BUF_SIZE=0x200000
++CONFIG_USB_FUNCTION_FASTBOOT=y
++CONFIG_CMD_USB_MASS_STORAGE=y
++CONFIG_FASTBOOT_BUF_ADDR=0xa0000000
++CONFIG_FASTBOOT_FLASH=y
++CONFIG_FASTBOOT_FLASH_MMC_DEV=0
++CONFIG_SYS_I2C_S3C24X0=y
++CONFIG_BUTTON_KEYBOARD=y
++CONFIG_MISC=y
++CONFIG_MMC_BROKEN_CD=y
++CONFIG_MMC_IO_VOLTAGE=y
++CONFIG_MMC_UHS_SUPPORT=y
++CONFIG_MMC_HS400_SUPPORT=y
++CONFIG_MMC_DW=y
++CONFIG_PHY=y
++CONFIG_PHY_EXYNOS_USBDRD=y
++CONFIG_PINCTRL=y
++CONFIG_PINCTRL_EXYNOS7885=y
++CONFIG_DM_PMIC=y
++CONFIG_PMIC_S2MPS11=y
++CONFIG_DM_REGULATOR=y
++CONFIG_DM_REGULATOR_FIXED=y
++CONFIG_DM_REGULATOR_S2MPS11=y
++CONFIG_SOC_SAMSUNG=y
++CONFIG_EXYNOS_PMU=y
++CONFIG_SYSRESET=y
++CONFIG_SYSRESET_CMD_POWEROFF=y
++CONFIG_SYSRESET_SYSCON=y
++CONFIG_USB=y
++CONFIG_DM_USB_GADGET=y
++CONFIG_USB_DWC3=y
++CONFIG_USB_DWC3_GENERIC=y
++CONFIG_USB_GADGET=y
++CONFIG_USB_GADGET_MANUFACTURER="Samsung"
++CONFIG_USB_GADGET_VENDOR_NUM=0x04e8
++CONFIG_USB_GADGET_PRODUCT_NUM=0x6860
++CONFIG_VIDEO=y
++CONFIG_VIDEO_FONT_16X32=y
++# CONFIG_VIDEO_FONT_8X16 is not set
++CONFIG_VIDEO_SIMPLE=y
++CONFIG_FS_EXT4=y
++CONFIG_FS_FAT=y
++CONFIG_SUPPORT_RAW_INITRD=y
+diff --git a/drivers/clk/exynos/Kconfig b/drivers/clk/exynos/Kconfig
+index dcecbd51b5b..3fd61a85c36 100644
+--- a/drivers/clk/exynos/Kconfig
++++ b/drivers/clk/exynos/Kconfig
+@@ -22,6 +22,14 @@ config CLK_EXYNOS7870
+ 	  This enables common clock driver support for platforms based
+ 	  on Samsung Exynos7870 SoC.
+ 
++config CLK_EXYNOS7885
++	bool "Clock driver for Samsung's Exynos7885 SoC"
++	select CLK_CCF
++	help
++	  This enables common clock driver support for platforms based
++	  on Samsung Exynos7885 SoC (also covers Exynos7904 / Galaxy A40).
++	  Provides CMU_TOP and CMU_FSYS clock domains needed for eMMC.
++
+ config CLK_EXYNOS850
+ 	bool "Clock driver for Samsung's Exynos850 SoC"
+ 	select CLK_CCF
+diff --git a/drivers/clk/exynos/Makefile b/drivers/clk/exynos/Makefile
+index f5d27d87bd2..4dff680a418 100644
+--- a/drivers/clk/exynos/Makefile
++++ b/drivers/clk/exynos/Makefile
+@@ -10,4 +10,5 @@
+ obj-$(CONFIG_$(PHASE_)CLK_CCF)	+= clk.o clk-pll.o
+ obj-$(CONFIG_CLK_EXYNOS7420)		+= clk-exynos7420.o
+ obj-$(CONFIG_CLK_EXYNOS7870)		+= clk-exynos7870.o
++obj-$(CONFIG_CLK_EXYNOS7885)		+= clk-exynos7885.o
+ obj-$(CONFIG_CLK_EXYNOS850)		+= clk-exynos850.o
+diff --git a/drivers/clk/exynos/clk-exynos7885.c b/drivers/clk/exynos/clk-exynos7885.c
+new file mode 100644
+index 00000000000..688394de496
+--- /dev/null
++++ b/drivers/clk/exynos/clk-exynos7885.c
+@@ -0,0 +1,237 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Samsung Exynos7885 clock driver for U-Boot.
++ *
++ * Covers CMU_TOP and CMU_FSYS — the minimal set needed to enumerate
++ * the eMMC (CLK_GOUT_MMC_EMBD_ACLK / SDCLKIN) and provides the
++ * foundation for adding more clock domains later.
++ *
++ * Register offsets and clock IDs are taken from the Linux kernel driver
++ * (drivers/clk/samsung/clk-exynos7885.c) and the dt-bindings header
++ * (include/dt-bindings/clock/exynos7885.h).
++ *
++ * Copyright (C) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ */
++
++#include "linux/clk-provider.h"
++#include <dm.h>
++#include <asm/io.h>
++#include <dt-bindings/clock/exynos7885.h>
++#include "clk.h"
++
++enum exynos7885_cmu_id {
++	CMU_TOP,
++	CMU_FSYS,
++};
++
++/* ---- CMU_TOP (0x12060000) ------------------------------------------ */
++
++#define PLL_CON0_PLL_SHARED0				0x0100
++#define PLL_CON0_PLL_SHARED1				0x0120
++
++#define CLK_CON_MUX_MUX_CLKCMU_FSYS_BUS		0x1028
++#define CLK_CON_MUX_MUX_CLKCMU_FSYS_MMC_EMBD		0x1030
++#define CLK_CON_MUX_MUX_CLKCMU_FSYS_USB30DRD		0x1038
++
++#define CLK_CON_DIV_PLL_SHARED0_DIV2			0x189c
++#define CLK_CON_DIV_PLL_SHARED1_DIV2			0x18ac
++#define CLK_CON_DIV_CLKCMU_FSYS_BUS			0x1844
++#define CLK_CON_DIV_CLKCMU_FSYS_MMC_EMBD		0x184c
++#define CLK_CON_DIV_CLKCMU_FSYS_USB30DRD		0x1854
++#define CLK_CON_DIV_PLL_SHARED0_DIV4			0x18a4
++#define CLK_CON_DIV_PLL_SHARED1_DIV4			0x18b4
++
++#define CLK_CON_GAT_GATE_CLKCMU_FSYS_BUS		0x2044
++#define CLK_CON_GAT_GATE_CLKCMU_FSYS_MMC_EMBD		0x204c
++#define CLK_CON_GAT_GATE_CLKCMU_FSYS_USB30DRD		0x2054
++
++static const struct samsung_pll_clock top_pll_clks[] = {
++	PLL(pll_1417x, CLK_FOUT_SHARED0_PLL, "fout_shared0_pll", "oscclk",
++	    PLL_CON0_PLL_SHARED0),
++	PLL(pll_1417x, CLK_FOUT_SHARED1_PLL, "fout_shared1_pll", "oscclk",
++	    PLL_CON0_PLL_SHARED1),
++};
++
++/* Step 1: select between oscclk and fout_*_pll (PLL_CON0 bit 4) */
++PNAME(mout_shared0_pll_p)	= { "oscclk", "fout_shared0_pll" };
++PNAME(mout_shared1_pll_p)	= { "oscclk", "fout_shared1_pll" };
++
++static const struct samsung_mux_clock top_pll_mux_clks[] = {
++	MUX(CLK_MOUT_SHARED0_PLL, "mout_shared0_pll", mout_shared0_pll_p,
++	    PLL_CON0_PLL_SHARED0, 4, 1),
++	MUX(CLK_MOUT_SHARED1_PLL, "mout_shared1_pll", mout_shared1_pll_p,
++	    PLL_CON0_PLL_SHARED1, 4, 1),
++};
++
++/* Step 2: /2 and /4 dividers off the PLL outputs */
++static const struct samsung_div_clock top_pll_div_clks[] = {
++	DIV(CLK_DOUT_SHARED0_DIV2, "dout_shared0_div2", "mout_shared0_pll",
++	    CLK_CON_DIV_PLL_SHARED0_DIV2, 0, 1),
++	DIV(CLK_DOUT_SHARED1_DIV2, "dout_shared1_div2", "mout_shared1_pll",
++	    CLK_CON_DIV_PLL_SHARED1_DIV2, 0, 1),
++	DIV(CLK_DOUT_SHARED0_DIV4, "dout_shared0_div4", "mout_shared0_pll",
++	    CLK_CON_DIV_PLL_SHARED0_DIV4, 0, 2),
++	DIV(CLK_DOUT_SHARED1_DIV4, "dout_shared1_div4", "mout_shared1_pll",
++	    CLK_CON_DIV_PLL_SHARED1_DIV4, 0, 2),
++};
++
++/* Step 3: route PLL outputs to FSYS subsystem */
++PNAME(mout_fsys_bus_p)		= { "dout_shared0_div2", "dout_shared1_div2" };
++PNAME(mout_fsys_mmc_embd_p)	= { "dout_shared0_div2", "dout_shared1_div2" };
++PNAME(mout_fsys_usb30drd_p)	= { "dout_shared0_div4", "dout_shared1_div4" };
++
++static const struct samsung_mux_clock top_fsys_mux_clks[] = {
++	MUX(CLK_MOUT_FSYS_BUS, "mout_fsys_bus", mout_fsys_bus_p,
++	    CLK_CON_MUX_MUX_CLKCMU_FSYS_BUS, 0, 1),
++	MUX(CLK_MOUT_FSYS_MMC_EMBD, "mout_fsys_mmc_embd", mout_fsys_mmc_embd_p,
++	    CLK_CON_MUX_MUX_CLKCMU_FSYS_MMC_EMBD, 0, 1),
++	MUX(CLK_MOUT_FSYS_USB30DRD, "mout_fsys_usb30drd", mout_fsys_usb30drd_p,
++	    CLK_CON_MUX_MUX_CLKCMU_FSYS_USB30DRD, 0, 1),
++};
++
++/* Step 4: gates feeding the FSYS domain */
++static const struct samsung_gate_clock top_fsys_gate_clks[] = {
++	GATE(CLK_GOUT_FSYS_BUS, "gout_fsys_bus", "mout_fsys_bus",
++	     CLK_CON_GAT_GATE_CLKCMU_FSYS_BUS, 21,
++	     CLK_IS_CRITICAL | CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_FSYS_MMC_EMBD, "gout_fsys_mmc_embd", "mout_fsys_mmc_embd",
++	     CLK_CON_GAT_GATE_CLKCMU_FSYS_MMC_EMBD, 21,
++	     CLK_IS_CRITICAL | CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_FSYS_USB30DRD, "gout_fsys_usb30drd", "mout_fsys_usb30drd",
++	     CLK_CON_GAT_GATE_CLKCMU_FSYS_USB30DRD, 21,
++	     CLK_IS_CRITICAL | CLK_SET_RATE_PARENT, 0),
++};
++
++/* Step 5: output dividers — these are what CMU_FSYS user muxes receive */
++static const struct samsung_div_clock top_fsys_div_clks[] = {
++	DIV(CLK_DOUT_FSYS_BUS, "dout_fsys_bus", "gout_fsys_bus",
++	    CLK_CON_DIV_CLKCMU_FSYS_BUS, 0, 4),
++	DIV(CLK_DOUT_FSYS_MMC_EMBD, "dout_fsys_mmc_embd", "gout_fsys_mmc_embd",
++	    CLK_CON_DIV_CLKCMU_FSYS_MMC_EMBD, 0, 9),
++	DIV(CLK_DOUT_FSYS_USB30DRD, "dout_fsys_usb30drd", "gout_fsys_usb30drd",
++	    CLK_CON_DIV_CLKCMU_FSYS_USB30DRD, 0, 4),
++};
++
++static const struct samsung_clk_group top_cmu_clks[] = {
++	{ S_CLK_PLL,  top_pll_clks,       ARRAY_SIZE(top_pll_clks) },
++	{ S_CLK_MUX,  top_pll_mux_clks,   ARRAY_SIZE(top_pll_mux_clks) },
++	{ S_CLK_DIV,  top_pll_div_clks,   ARRAY_SIZE(top_pll_div_clks) },
++	{ S_CLK_MUX,  top_fsys_mux_clks,  ARRAY_SIZE(top_fsys_mux_clks) },
++	{ S_CLK_GATE, top_fsys_gate_clks, ARRAY_SIZE(top_fsys_gate_clks) },
++	{ S_CLK_DIV,  top_fsys_div_clks,  ARRAY_SIZE(top_fsys_div_clks) },
++};
++
++static int exynos7885_cmu_top_probe(struct udevice *dev)
++{
++	return samsung_register_cmu(dev, CMU_TOP, top_cmu_clks,
++				    exynos7885_cmu_top);
++}
++
++static const struct udevice_id exynos7885_cmu_top_ids[] = {
++	{ .compatible = "samsung,exynos7885-cmu-top" },
++	{ }
++};
++
++SAMSUNG_CLK_OPS(exynos7885_cmu_top, CMU_TOP);
++
++U_BOOT_DRIVER(exynos7885_cmu_top) = {
++	.name		= "exynos7885-cmu-top",
++	.id		= UCLASS_CLK,
++	.of_match	= exynos7885_cmu_top_ids,
++	.ops		= &exynos7885_cmu_top_clk_ops,
++	.probe		= exynos7885_cmu_top_probe,
++	.flags		= DM_FLAG_PRE_RELOC,
++};
++
++/* ---- CMU_FSYS (0x13400000) ----------------------------------------- */
++
++/*
++ * PLL_CON0_MUX_CLKCMU_FSYS_*_USER registers live in CMU_FSYS and
++ * work as "user muxes" that choose between oscclk and the clock
++ * delivered from CMU_TOP (dout_fsys_mmc_embd / dout_fsys_bus).
++ * Bit 4 is the mux select; bit 29 ("ignore" bit) disables the clock.
++ */
++#define PLL_CON0_MUX_CLKCMU_FSYS_BUS_USER		0x0100
++#define PLL_CON0_MUX_CLKCMU_FSYS_MMC_EMBD_USER		0x0140
++#define PLL_CON0_MUX_CLKCMU_FSYS_USB30DRD_USER		0x0180
++
++#define CLK_CON_GAT_CLK_FSYS_USB20PHY_CLKCORE		0x200c
++#define CLK_CON_GAT_GOUT_FSYS_MMC_EMBD_I_ACLK		0x2038
++#define CLK_CON_GAT_GOUT_FSYS_MMC_EMBD_SDCLKIN		0x203c
++#define CLK_CON_GAT_GOUT_FSYS_USB30DRD_ACLK_20PHYCTRL	0x2068
++#define CLK_CON_GAT_GOUT_FSYS_USB30DRD_BUS_CLK_EARLY	0x2074
++#define CLK_CON_GAT_GOUT_FSYS_USB30DRD_REF_CLK		0x2078
++
++PNAME(mout_fsys_bus_user_p)	   = { "oscclk", "dout_fsys_bus" };
++PNAME(mout_fsys_mmc_embd_user_p)  = { "oscclk", "dout_fsys_mmc_embd" };
++PNAME(mout_fsys_usb30drd_user_p)  = { "oscclk", "dout_fsys_usb30drd" };
++
++static const struct samsung_mux_clock fsys_mux_clks[] = {
++	MUX(CLK_MOUT_FSYS_BUS_USER, "mout_fsys_bus_user",
++	    mout_fsys_bus_user_p,
++	    PLL_CON0_MUX_CLKCMU_FSYS_BUS_USER, 4, 1),
++	MUX(CLK_MOUT_FSYS_MMC_EMBD_USER, "mout_fsys_mmc_embd_user",
++	    mout_fsys_mmc_embd_user_p,
++	    PLL_CON0_MUX_CLKCMU_FSYS_MMC_EMBD_USER, 4, 1),
++	MUX(CLK_MOUT_FSYS_USB30DRD_USER, "mout_fsys_usb30drd_user",
++	    mout_fsys_usb30drd_user_p,
++	    PLL_CON0_MUX_CLKCMU_FSYS_USB30DRD_USER, 4, 1),
++};
++
++static const struct samsung_gate_clock fsys_gate_clks[] = {
++	GATE(CLK_GOUT_MMC_EMBD_ACLK, "gout_mmc_embd_aclk",
++	     "mout_fsys_bus_user",
++	     CLK_CON_GAT_GOUT_FSYS_MMC_EMBD_I_ACLK, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	GATE(CLK_GOUT_MMC_EMBD_SDCLKIN, "gout_mmc_embd_sdclkin",
++	     "mout_fsys_mmc_embd_user",
++	     CLK_CON_GAT_GOUT_FSYS_MMC_EMBD_SDCLKIN, 21,
++	     CLK_SET_RATE_PARENT, 0),
++	/*
++	 * USB20PHY_CLKCORE is the UTMI reference fed to the PHY analogue.
++	 * Its hardware parent is the USB PLL (pll_1418x, not supported in
++	 * U-Boot), but S-Boot has already locked the PLL and the PHY only
++	 * needs the *oscillator* rate (26 MHz) to select the correct FSEL
++	 * register encoding.  Wire it to oscclk so clk_get_rate() returns
++	 * 26 MHz without touching the PLL.
++	 */
++	GATE(CLK_FSYS_USB20PHY_CLKCORE, "clk_fsys_usb20phy_clkcore",
++	     "oscclk",
++	     CLK_CON_GAT_CLK_FSYS_USB20PHY_CLKCORE, 21, 0, 0),
++	GATE(CLK_FSYS_USB30DRD_ACLK_20PHYCTRL, "clk_fsys_usb30drd_aclk_20phyctrl",
++	     "mout_fsys_bus_user",
++	     CLK_CON_GAT_GOUT_FSYS_USB30DRD_ACLK_20PHYCTRL, 21, 0, 0),
++	GATE(CLK_FSYS_USB30DRD_BUS_CLK_EARLY, "clk_fsys_usb30drd_bus_clk_early",
++	     "mout_fsys_bus_user",
++	     CLK_CON_GAT_GOUT_FSYS_USB30DRD_BUS_CLK_EARLY, 21, 0, 0),
++	GATE(CLK_FSYS_USB30DRD_REF_CLK, "clk_fsys_usb30drd_ref_clk",
++	     "mout_fsys_usb30drd_user",
++	     CLK_CON_GAT_GOUT_FSYS_USB30DRD_REF_CLK, 21, 0, 0),
++};
++
++static const struct samsung_clk_group fsys_cmu_clks[] = {
++	{ S_CLK_MUX,  fsys_mux_clks,  ARRAY_SIZE(fsys_mux_clks) },
++	{ S_CLK_GATE, fsys_gate_clks, ARRAY_SIZE(fsys_gate_clks) },
++};
++
++static int exynos7885_cmu_fsys_probe(struct udevice *dev)
++{
++	return samsung_register_cmu(dev, CMU_FSYS, fsys_cmu_clks,
++				    exynos7885_cmu_top);
++}
++
++static const struct udevice_id exynos7885_cmu_fsys_ids[] = {
++	{ .compatible = "samsung,exynos7885-cmu-fsys" },
++	{ }
++};
++
++SAMSUNG_CLK_OPS(exynos7885_cmu_fsys, CMU_FSYS);
++
++U_BOOT_DRIVER(exynos7885_cmu_fsys) = {
++	.name		= "exynos7885-cmu-fsys",
++	.id		= UCLASS_CLK,
++	.of_match	= exynos7885_cmu_fsys_ids,
++	.ops		= &exynos7885_cmu_fsys_clk_ops,
++	.probe		= exynos7885_cmu_fsys_probe,
++	.flags		= DM_FLAG_PRE_RELOC,
++};
+diff --git a/drivers/mmc/dw_mmc.c b/drivers/mmc/dw_mmc.c
+index d9c05b223d5..79b027e93f0 100644
+--- a/drivers/mmc/dw_mmc.c
++++ b/drivers/mmc/dw_mmc.c
+@@ -201,7 +201,7 @@ static int dwmci_fifo_ready(struct dwmci_host *host, u32 bit, u32 *len)
+ 
+ static unsigned int dwmci_get_timeout(struct mmc *mmc, const unsigned int size)
+ {
+-	unsigned int timeout;
++	unsigned int timeout, min_timeout;
+ 
+ 	timeout = size * 8;	/* counting in bits */
+ 	timeout *= 10;		/* wait 10 times as long */
+@@ -211,6 +211,20 @@ static unsigned int dwmci_get_timeout(struct mmc *mmc, const unsigned int size)
+ 	timeout *= 1000;	/* counting in msec */
+ 	timeout = (timeout < 1000) ? 1000 : timeout;
+ 
++	/*
++	 * The computation above assumes the bus actually runs at mmc->clock.
++	 * On platforms where the controller source clock cannot be raised
++	 * (clk_set_rate() returns -ENOSYS), the real throughput is far lower
++	 * than nominal, so the value above can be much too short for large
++	 * transfers and a correct-but-slow write/read spuriously times out.
++	 * Floor the timeout to what the transfer needs at a pessimistic
++	 * ~1 MB/s plus 1 s of slack. This only ever lengthens the timeout, so
++	 * it never affects platforms that already run at full speed.
++	 */
++	min_timeout = size / 1024 + 1000;	/* ~1 MB/s, in msec */
++	if (timeout < min_timeout)
++		timeout = min_timeout;
++
+ 	return timeout;
+ }
+ 
+diff --git a/drivers/mmc/exynos_dw_mmc.c b/drivers/mmc/exynos_dw_mmc.c
+index 7ccd113bd79..589a0d2c32f 100644
+--- a/drivers/mmc/exynos_dw_mmc.c
++++ b/drivers/mmc/exynos_dw_mmc.c
+@@ -205,8 +205,8 @@ static unsigned int exynos_dwmci_get_clk(struct dwmci_host *host, uint freq)
+ 	clk_div = exynos_dwmmc_get_ciu_div(host);
+ 	err = exynos_dwmmc_set_sclk(host, freq * clk_div);
+ 	if (err) {
+-		printf("DWMMC%d: failed to set clock rate (%d); "
+-		       "continue anyway\n", host->dev_index, err);
++		debug("DWMMC%d: failed to set clock rate (%d); "
++		      "continue anyway\n", host->dev_index, err);
+ 	}
+ 
+ 	err = exynos_dwmmc_get_sclk(host, &sclk);
+@@ -434,8 +434,8 @@ static int exynos_dwmmc_probe(struct udevice *dev)
+ 
+ 	err = exynos_dwmmc_set_sclk(host, freq);
+ 	if (err) {
+-		printf("DWMMC%d: failed to set clock rate on probe (%d); "
+-		       "continue anyway\n", host->dev_index, err);
++		debug("DWMMC%d: failed to set clock rate on probe (%d); "
++		      "continue anyway\n", host->dev_index, err);
+ 	}
+ 
+ 	host->name = dev->name;
+diff --git a/drivers/phy/phy-exynos-usbdrd.c b/drivers/phy/phy-exynos-usbdrd.c
+index c5eed29a2c8..3ca65d2cff6 100644
+--- a/drivers/phy/phy-exynos-usbdrd.c
++++ b/drivers/phy/phy-exynos-usbdrd.c
+@@ -18,8 +18,9 @@
+ #include <linux/bitops.h>
+ #include <linux/delay.h>
+ 
+-/* Offset of PMU register controlling USB PHY output isolation */
+-#define EXYNOS_USBDRD_PHY_CONTROL		0x0704
++/* PMU register offsets controlling USB PHY output isolation */
++#define EXYNOS_USBDRD_PHY_CONTROL		0x0704	/* 5250/7870/850 */
++#define EXYNOS7885_USBDRD_PHY_CONTROL		0x0674	/* 7885 */
+ #define EXYNOS_PHY_ENABLE			BIT(0)
+ #define EXYNOS7870_PHY_ENABLE			BIT(1)
+ 
+@@ -117,12 +118,21 @@
+ 
+ /* Exynos850: USB DRD PHY registers */
+ #define EXYNOS850_DRD_LINKCTRL			0x04
++#define LINKCTRL_DIS_QACT_LINKGATE		BIT(12)
++#define LINKCTRL_DIS_QACT_ID0			BIT(11)
++#define LINKCTRL_DIS_QACT_VBUS_VALID		BIT(10)
++#define LINKCTRL_DIS_QACT_BVALID		BIT(9)
+ #define LINKCTRL_FORCE_QACT			BIT(8)
+ #define LINKCTRL_BUS_FILTER_BYPASS		GENMASK(7, 4)
+ 
++#define EXYNOS850_DRD_LINKPORT			0x08
++#define LINKPORT_HUB_PORT_SEL_OCD_U3		BIT(3)
++#define LINKPORT_HUB_PORT_SEL_OCD_U2		BIT(2)
++
+ #define EXYNOS850_DRD_CLKRST			0x20
+ #define CLKRST_LINK_SW_RST			BIT(0)
+ #define CLKRST_PORT_RST				BIT(1)
++#define CLKRST_PHY_RST_SEL			BIT(2)
+ #define CLKRST_PHY_SW_RST			BIT(3)
+ 
+ #define EXYNOS850_DRD_SSPPLLCTL			0x30
+@@ -143,8 +153,11 @@
+ #define HSP_VBUSVLDEXTSEL			BIT(13)
+ #define HSP_FSV_OUT_EN				BIT(24)
+ 
++#define EXYNOS850_DRD_HSP_TUNE			0x58
+ #define EXYNOS850_DRD_HSP_TEST			0x5c
+ #define HSP_TEST_SIDDQ				BIT(24)
++/* HS PHY tune (squelch / DC levels) read from the working downstream A40. */
++#define A40_HSP_TUNE_VALUE			0xd36f3727
+ 
+ #define KHZ					1000
+ #define MHZ					(KHZ * KHZ)
+@@ -152,6 +165,7 @@
+ enum exynos_usbdrd_phy_variant {
+ 	EXYNOS7870_USBDRD_PHY,
+ 	EXYNOS850_USBDRD_PHY,
++	EXYNOS7885_USBDRD_PHY,
+ };
+ 
+ /**
+@@ -175,6 +189,7 @@ struct exynos_usbdrd_phy {
+ static void exynos_usbdrd_phy_isol(struct exynos_usbdrd_phy *phy_drd,
+ 				   bool isolate)
+ {
++	unsigned int offset = EXYNOS_USBDRD_PHY_CONTROL;
+ 	unsigned int mask = EXYNOS_PHY_ENABLE, val;
+ 
+ 	if (!phy_drd->reg_pmu)
+@@ -182,10 +197,11 @@ static void exynos_usbdrd_phy_isol(struct exynos_usbdrd_phy *phy_drd,
+ 
+ 	if (phy_drd->variant == EXYNOS7870_USBDRD_PHY)
+ 		mask = EXYNOS7870_PHY_ENABLE;
++	else if (phy_drd->variant == EXYNOS7885_USBDRD_PHY)
++		offset = EXYNOS7885_USBDRD_PHY_CONTROL;
+ 
+ 	val = isolate ? 0 : mask;
+-	regmap_update_bits(phy_drd->reg_pmu, EXYNOS_USBDRD_PHY_CONTROL,
+-			   mask, val);
++	regmap_update_bits(phy_drd->reg_pmu, offset, mask, val);
+ }
+ 
+ /*
+@@ -418,6 +434,159 @@ static void exynos850_usbdrd_utmi_init(struct phy *phy)
+ 	writel(reg, regs_base + EXYNOS850_DRD_HSP);
+ }
+ 
++/*
++ * Exynos7885 USB DRD PHY init.  The 7885 uses PHY IP v3.0.0 (same USBCON
++ * register map as exynos850) but differs in several key ways:
++ *
++ * - PHY_RST_SEL must be set to put the PHY into SW-controlled reset mode;
++ *   without it, hardware may re-assert PHY reset after DCTL.CSFTRST.
++ * - LINK_SW_RST clears the link-layer state left by S-Boot (Odin/download).
++ * - HSP_EN_UTMISUSPEND | HSP_COMMONONN are SET, matching the downstream v3p1
++ *   enable for common_block_disable=1 (the A40 DT) and the mainline exynos850.
++ */
++static void exynos7885_usbdrd_utmi_init(struct phy *phy)
++{
++	struct exynos_usbdrd_phy *phy_drd = dev_get_priv(phy->dev);
++	void __iomem *regs_base = phy_drd->reg_phy;
++	u32 reg;
++
++	/*
++	 * Disable HWACG: force QACTIVE high so the PHY clock is not gated by the
++	 * Q-channel while we bring the link up (canonical exynos850 first step).
++	 */
++	reg = readl(regs_base + EXYNOS850_DRD_LINKCTRL);
++	reg |= LINKCTRL_FORCE_QACT;
++	writel(reg, regs_base + EXYNOS850_DRD_LINKCTRL);
++
++	/*
++	 * Link reset pulse (downstream v3p1 enable does this for version 03_0_0,
++	 * before asserting PHY reset) — clears link-layer state left by S-Boot.
++	 */
++	reg = readl(regs_base + EXYNOS850_DRD_CLKRST);
++	reg |= CLKRST_LINK_SW_RST;
++	writel(reg, regs_base + EXYNOS850_DRD_CLKRST);
++	udelay(10);
++	reg &= ~CLKRST_LINK_SW_RST;
++	writel(reg, regs_base + EXYNOS850_DRD_CLKRST);
++
++	/* Assert PHY SW reset in SW-controlled mode */
++	reg = readl(regs_base + EXYNOS850_DRD_CLKRST);
++	reg |= CLKRST_PHY_RST_SEL | CLKRST_PHY_SW_RST;
++	writel(reg, regs_base + EXYNOS850_DRD_CLKRST);
++
++	/* Power up PHY analog blocks (clear SIDDQ) */
++	reg = readl(regs_base + EXYNOS850_DRD_HSP_TEST);
++	reg &= ~HSP_TEST_SIDDQ;
++	writel(reg, regs_base + EXYNOS850_DRD_HSP_TEST);
++
++	/* Enable UTMI+: clear forced-suspend/sleep and D+/D- pulldowns */
++	reg = readl(regs_base + EXYNOS850_DRD_UTMI);
++	reg &= ~(UTMI_FORCE_SUSPEND | UTMI_FORCE_SLEEP |
++		 UTMI_DP_PULLDOWN | UTMI_DM_PULLDOWN);
++	writel(reg, regs_base + EXYNOS850_DRD_UTMI);
++
++	/*
++	 * HSP: SET EN_UTMISUSPEND | COMMONONN.  Both the mainline exynos850 init
++	 * and the downstream v3p1 enable program these (the latter exactly when
++	 * common_block_disable=1, which the A40 DT sets).  We previously cleared
++	 * them to dodge an EP0 timeout, but that was while the PHY had no refclk
++	 * (EP0 timed out regardless); with PLL_USB now locked, follow the refs.
++	 */
++	reg = readl(regs_base + EXYNOS850_DRD_HSP);
++	reg |= HSP_EN_UTMISUSPEND | HSP_COMMONONN;
++	writel(reg, regs_base + EXYNOS850_DRD_HSP);
++
++	/* Force BVALID/VBUSVALID — no VBUS pad on this device */
++	reg = readl(regs_base + EXYNOS850_DRD_UTMI);
++	reg |= UTMI_FORCE_BVALID | UTMI_FORCE_VBUSVALID;
++	writel(reg, regs_base + EXYNOS850_DRD_UTMI);
++
++	reg = readl(regs_base + EXYNOS850_DRD_HSP);
++	reg |= HSP_VBUSVLDEXT | HSP_VBUSVLDEXTSEL;
++	writel(reg, regs_base + EXYNOS850_DRD_HSP);
++
++	/*
++	 * Bypass the LINKCTRL bus filter on the VBUS/BVALID inputs (canonical
++	 * exynos850 step, "VBUS Valid and D+ pull-up control by VBUS pad usage").
++	 * This phone has no VBUS pad wired to the PHY (the MUIC owns VBUS), so the
++	 * forced VBUSVALID/BVALID above only reach the link through the bus filter
++	 * if it is bypassed.  Without this the link's filtered vbus_valid never
++	 * asserts and it stays at USBLNKST=Disconnected even though RUNSTOP=1.
++	 */
++	reg = readl(regs_base + EXYNOS850_DRD_LINKCTRL);
++	reg |= FIELD_PREP(LINKCTRL_BUS_FILTER_BYPASS, 0xf);
++	writel(reg, regs_base + EXYNOS850_DRD_LINKCTRL);
++
++	/*
++	 * OVC (over-current) IO select.  The downstream v3p1 enable, for
++	 * use_io_for_ovc=0 (the A40 DT), SETS OCD_U2|OCD_U3 in LINK_PORT — routing
++	 * over-current detection away from the (floating) IO pads.  Left at the
++	 * default the port can sense a false over-current and stay disabled, which
++	 * looks exactly like "link never connects".  We never set this before.
++	 */
++	reg = readl(regs_base + EXYNOS850_DRD_LINKPORT);
++	reg |= LINKPORT_HUB_PORT_SEL_OCD_U3 | LINKPORT_HUB_PORT_SEL_OCD_U2;
++	writel(reg, regs_base + EXYNOS850_DRD_LINKPORT);
++
++	/* PLL frequency select — must be set while PHY is in SW reset */
++	reg = readl(regs_base + EXYNOS850_DRD_SSPPLLCTL);
++	reg &= ~SSPPLLCTL_FSEL;
++	switch (phy_drd->extrefclk) {
++	case EXYNOS5_FSEL_50MHZ:
++		reg |= FIELD_PREP(SSPPLLCTL_FSEL, 7);
++		break;
++	case EXYNOS5_FSEL_26MHZ:
++		reg |= FIELD_PREP(SSPPLLCTL_FSEL, 6);
++		break;
++	case EXYNOS5_FSEL_24MHZ:
++		reg |= FIELD_PREP(SSPPLLCTL_FSEL, 2);
++		break;
++	case EXYNOS5_FSEL_20MHZ:
++		reg |= FIELD_PREP(SSPPLLCTL_FSEL, 1);
++		break;
++	case EXYNOS5_FSEL_19MHZ2:
++		reg |= FIELD_PREP(SSPPLLCTL_FSEL, 0);
++		break;
++	default:
++		dev_warn(phy->dev, "unsupported ref clk: %#.2x\n",
++			 phy_drd->extrefclk);
++		break;
++	}
++	writel(reg, regs_base + EXYNOS850_DRD_SSPPLLCTL);
++
++	/*
++	 * Release PHY SW reset.  Matches the downstream phy_sw_rst_low() for
++	 * version 03_0_0: KEEP PHY_RST_SEL set (stay in SW-controlled reset
++	 * mode), clear PHY_SW_RST and PORT_RST.  We previously added a further
++	 * write clearing PHY_RST_SEL ("return to HW control" / CLKRST=0); the
++	 * working driver never does that, so it's removed.
++	 */
++	udelay(100);
++	reg = readl(regs_base + EXYNOS850_DRD_CLKRST);
++	reg |= CLKRST_PHY_RST_SEL;
++	reg &= ~(CLKRST_PHY_SW_RST | CLKRST_PORT_RST);
++	writel(reg, regs_base + EXYNOS850_DRD_CLKRST);
++	udelay(75);
++
++	/*
++	 * Match the working downstream A40 PHY state (read live from its 4.4
++	 * kernel) for the registers our init didn't set.  HSP_TUNE holds the HS
++	 * squelch threshold + DC levels — at the power-on default the PHY may not
++	 * detect the host's bus activity, so the link never leaves Disconnected.
++	 * Also set HSP_TEST bit19 and LINKCTRL bit16, both set on the working PHY.
++	 */
++	writel(A40_HSP_TUNE_VALUE, regs_base + EXYNOS850_DRD_HSP_TUNE);
++
++	reg = readl(regs_base + EXYNOS850_DRD_HSP_TEST);
++	reg &= ~HSP_TEST_SIDDQ;
++	reg |= BIT(19);
++	writel(reg, regs_base + EXYNOS850_DRD_HSP_TEST);
++
++	reg = readl(regs_base + EXYNOS850_DRD_LINKCTRL);
++	reg |= BIT(16);
++	writel(reg, regs_base + EXYNOS850_DRD_LINKCTRL);
++}
++
+ static void exynos7870_usbdrd_utmi_exit(struct phy *phy)
+ {
+ 	struct exynos_usbdrd_phy *phy_drd = dev_get_priv(phy->dev);
+@@ -487,6 +656,9 @@ static int exynos_usbdrd_phy_init(struct phy *phy)
+ 	case EXYNOS850_USBDRD_PHY:
+ 		exynos850_usbdrd_utmi_init(phy);
+ 		break;
++	case EXYNOS7885_USBDRD_PHY:
++		exynos7885_usbdrd_utmi_init(phy);
++		break;
+ 	default:
+ 		dev_err(phy->dev, "Failed to recognize phy variant\n");
+ 	}
+@@ -510,6 +682,7 @@ static int exynos_usbdrd_phy_exit(struct phy *phy)
+ 		exynos7870_usbdrd_utmi_exit(phy);
+ 		break;
+ 	case EXYNOS850_USBDRD_PHY:
++	case EXYNOS7885_USBDRD_PHY:
+ 		exynos850_usbdrd_utmi_exit(phy);
+ 		break;
+ 	default:
+@@ -620,6 +793,10 @@ static const struct udevice_id exynos_usbdrd_phy_of_match[] = {
+ 		.compatible = "samsung,exynos7870-usbdrd-phy",
+ 		.data = EXYNOS7870_USBDRD_PHY,
+ 	},
++	{
++		.compatible = "samsung,exynos7885-usbdrd-phy",
++		.data = EXYNOS7885_USBDRD_PHY,
++	},
+ 	{
+ 		.compatible = "samsung,exynos850-usbdrd-phy",
+ 		.data = EXYNOS850_USBDRD_PHY,
+diff --git a/drivers/pinctrl/exynos/Kconfig b/drivers/pinctrl/exynos/Kconfig
+index 1b7fb62bc4b..13042b447d2 100644
+--- a/drivers/pinctrl/exynos/Kconfig
++++ b/drivers/pinctrl/exynos/Kconfig
+@@ -24,3 +24,11 @@ config PINCTRL_EXYNOS850
+ 	help
+ 	  Support pin multiplexing and pin configuration control on
+ 	  Samsung's Exynos850 SoC.
++
++config PINCTRL_EXYNOS7885
++	bool "Samsung Exynos7885 pinctrl driver"
++	depends on ARCH_EXYNOS && PINCTRL_FULL
++	select PINCTRL_EXYNOS
++	help
++	  Support pin multiplexing and pin configuration control on
++	  Samsung's Exynos7885 SoC (also used on the Exynos7904).
+diff --git a/drivers/pinctrl/exynos/Makefile b/drivers/pinctrl/exynos/Makefile
+index 3abe1226eb7..cb0bb1ece99 100644
+--- a/drivers/pinctrl/exynos/Makefile
++++ b/drivers/pinctrl/exynos/Makefile
+@@ -7,3 +7,4 @@ obj-$(CONFIG_PINCTRL_EXYNOS)		+= pinctrl-exynos.o
+ obj-$(CONFIG_PINCTRL_EXYNOS7420)	+= pinctrl-exynos7420.o
+ obj-$(CONFIG_PINCTRL_EXYNOS78x0)	+= pinctrl-exynos78x0.o
+ obj-$(CONFIG_PINCTRL_EXYNOS850)		+= pinctrl-exynos850.o
++obj-$(CONFIG_PINCTRL_EXYNOS7885)	+= pinctrl-exynos7885.o
+diff --git a/drivers/pinctrl/exynos/pinctrl-exynos7885.c b/drivers/pinctrl/exynos/pinctrl-exynos7885.c
+new file mode 100644
+index 00000000000..22a33406358
+--- /dev/null
++++ b/drivers/pinctrl/exynos/pinctrl-exynos7885.c
+@@ -0,0 +1,112 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Exynos7885 pinctrl driver.
++ *
++ * Bank data ported from the Linux exynos7885 pin-controller tables.
++ * Modeled on pinctrl-exynos850.c.
++ */
++
++#include <dm.h>
++#include <dm/pinctrl.h>
++#include "pinctrl-exynos.h"
++
++#define EXYNOS7885_PIN_BANK(pins, reg, id)		\
++	{						\
++		.type		= &exynos7885_bank_type,\
++		.offset		= reg,			\
++		.nr_pins	= pins,			\
++		.name		= id			\
++	}
++
++/* CON, DAT, PUD, DRV */
++static const struct samsung_pin_bank_type exynos7885_bank_type = {
++	.fld_width = { 4, 1, 4, 4, },
++	.reg_offset = { 0x00, 0x04, 0x08, 0x0c, },
++};
++
++static const struct pinctrl_ops exynos7885_pinctrl_ops = {
++	.set_state = exynos_pinctrl_set_state
++};
++
++/* pin banks of exynos7885 pin-controller 0 (ALIVE) */
++static const struct samsung_pin_bank_data exynos7885_pin_banks0[] = {
++	EXYNOS7885_PIN_BANK(3, 0x000, "etc0"),
++	EXYNOS7885_PIN_BANK(3, 0x020, "etc1"),
++	EXYNOS7885_PIN_BANK(8, 0x040, "gpa0"),
++	EXYNOS7885_PIN_BANK(8, 0x060, "gpa1"),
++	EXYNOS7885_PIN_BANK(8, 0x080, "gpa2"),
++	EXYNOS7885_PIN_BANK(5, 0x0a0, "gpq0"),
++};
++
++/* pin banks of exynos7885 pin-controller 1 (DISPAUD) */
++static const struct samsung_pin_bank_data exynos7885_pin_banks1[] = {
++	EXYNOS7885_PIN_BANK(5, 0x000, "gpb0"),
++	EXYNOS7885_PIN_BANK(4, 0x020, "gpb1"),
++	EXYNOS7885_PIN_BANK(5, 0x040, "gpb2"),
++};
++
++/* pin banks of exynos7885 pin-controller 2 (FSYS) */
++static const struct samsung_pin_bank_data exynos7885_pin_banks2[] = {
++	EXYNOS7885_PIN_BANK(4, 0x000, "gpf0"),
++	EXYNOS7885_PIN_BANK(8, 0x020, "gpf2"),
++	EXYNOS7885_PIN_BANK(6, 0x040, "gpf3"),
++	EXYNOS7885_PIN_BANK(6, 0x060, "gpf4"),
++};
++
++/* pin banks of exynos7885 pin-controller 3 (TOP) */
++static const struct samsung_pin_bank_data exynos7885_pin_banks3[] = {
++	EXYNOS7885_PIN_BANK(4, 0x000, "gpp0"),
++	EXYNOS7885_PIN_BANK(3, 0x020, "gpg0"),
++	EXYNOS7885_PIN_BANK(4, 0x040, "gpp1"),
++	EXYNOS7885_PIN_BANK(4, 0x060, "gpp2"),
++	EXYNOS7885_PIN_BANK(3, 0x080, "gpp3"),
++	EXYNOS7885_PIN_BANK(6, 0x0a0, "gpp4"),
++	EXYNOS7885_PIN_BANK(4, 0x0c0, "gpp5"),
++	EXYNOS7885_PIN_BANK(5, 0x0e0, "gpp6"),
++	EXYNOS7885_PIN_BANK(2, 0x100, "gpp7"),
++	EXYNOS7885_PIN_BANK(2, 0x120, "gpp8"),
++	EXYNOS7885_PIN_BANK(8, 0x140, "gpg1"),
++	EXYNOS7885_PIN_BANK(8, 0x160, "gpg2"),
++	EXYNOS7885_PIN_BANK(8, 0x180, "gpg3"),
++	EXYNOS7885_PIN_BANK(2, 0x1a0, "gpg4"),
++	EXYNOS7885_PIN_BANK(4, 0x1c0, "gpc0"),
++	EXYNOS7885_PIN_BANK(8, 0x1e0, "gpc1"),
++	EXYNOS7885_PIN_BANK(8, 0x200, "gpc2"),
++};
++
++static const struct samsung_pin_ctrl exynos7885_pin_ctrl[] = {
++	{
++		/* pin-controller instance 0 ALIVE data */
++		.pin_banks	= exynos7885_pin_banks0,
++		.nr_banks	= ARRAY_SIZE(exynos7885_pin_banks0),
++	}, {
++		/* pin-controller instance 1 DISPAUD data */
++		.pin_banks	= exynos7885_pin_banks1,
++		.nr_banks	= ARRAY_SIZE(exynos7885_pin_banks1),
++	}, {
++		/* pin-controller instance 2 FSYS data */
++		.pin_banks	= exynos7885_pin_banks2,
++		.nr_banks	= ARRAY_SIZE(exynos7885_pin_banks2),
++	}, {
++		/* pin-controller instance 3 TOP data */
++		.pin_banks	= exynos7885_pin_banks3,
++		.nr_banks	= ARRAY_SIZE(exynos7885_pin_banks3),
++	},
++	{/* list terminator */}
++};
++
++static const struct udevice_id exynos7885_pinctrl_ids[] = {
++	{ .compatible = "samsung,exynos7885-pinctrl",
++		.data = (ulong)exynos7885_pin_ctrl },
++	{ }
++};
++
++U_BOOT_DRIVER(pinctrl_exynos7885) = {
++	.name		= "pinctrl_exynos7885",
++	.id		= UCLASS_PINCTRL,
++	.of_match	= exynos7885_pinctrl_ids,
++	.priv_auto	= sizeof(struct exynos_pinctrl_priv),
++	.ops		= &exynos7885_pinctrl_ops,
++	.probe		= exynos_pinctrl_probe,
++	.bind		= exynos_pinctrl_bind,
++};
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index be198041f08..35939d2b441 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -726,6 +726,15 @@ static int dwc3_core_init(struct dwc3 *dwc)
+ 
+ 	dwc3_core_num_eps(dwc);
+ 
++	/*
++	 * A40: match the working downstream GCTL (0x61a92005) — disable DWC3
++	 * clock gating.  U-Boot clears DSBLCLKGTNG for device-mode rev>2.50a, but
++	 * with gating enabled the controller parks its clocks while the link sits
++	 * at USBLNKST=Disconnected, so it never produces SOF / sees the host
++	 * (STAR#9000588375: clock-gating SOF/ITP issue).
++	 */
++	reg |= DWC3_GCTL_DSBLCLKGTNG;
++
+ 	dwc3_writel(dwc->regs, DWC3_GCTL, reg);
+ 
+ 	ret = dwc3_alloc_scratch_buffers(dwc);
+diff --git a/drivers/usb/dwc3/dwc3-generic.c b/drivers/usb/dwc3/dwc3-generic.c
+index 22b9ef0b24e..64afd2daf53 100644
+--- a/drivers/usb/dwc3/dwc3-generic.c
++++ b/drivers/usb/dwc3/dwc3-generic.c
+@@ -730,6 +730,7 @@ static const struct udevice_id dwc3_glue_ids[] = {
+ 	{ .compatible = "fsl,imx8mq-dwc3" },
+ 	{ .compatible = "intel,tangier-dwc3" },
+ 	{ .compatible = "samsung,exynos7870-dwusb3" },
++	{ .compatible = "samsung,exynos7885-dwusb3" },
+ 	{ .compatible = "samsung,exynos850-dwusb3" },
+ 	{ }
+ };
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index 24ae0c232f6..26b391d123b 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -1412,6 +1412,20 @@ static int dwc3_gadget_run_stop(struct dwc3 *dwc, int is_on, int suspend)
+ 		if (dwc->has_hibernation)
+ 			reg |= DWC3_DCTL_KEEP_CONNECT;
+ 
++		/*
++		 * Per the DWC3 programming guide, GUSB2PHYCFG.SUSPHY must be 0
++		 * when RUNSTOP first transitions to 1; otherwise the UTMI PHY is
++		 * suspended and the device never pulls up D+ (core stays idle,
++		 * no events).  dwc3_core_init() sets SUSPHY=1 for revisions
++		 * >1.94a, so clear it here before connecting.
++		 */
++		{
++			u32 phycfg = dwc3_readl(dwc->regs, DWC3_GUSB2PHYCFG(0));
++
++			phycfg &= ~DWC3_GUSB2PHYCFG_SUSPHY;
++			dwc3_writel(dwc->regs, DWC3_GUSB2PHYCFG(0), phycfg);
++		}
++
+ 		dwc->pullups_connected = true;
+ 	} else {
+ 		reg &= ~DWC3_DCTL_RUN_STOP;
+diff --git a/drivers/usb/gadget/g_dnl.c b/drivers/usb/gadget/g_dnl.c
+index f2540eb6ded..9cf1066bd7e 100644
+--- a/drivers/usb/gadget/g_dnl.c
++++ b/drivers/usb/gadget/g_dnl.c
+@@ -260,6 +260,7 @@ static int g_dnl_bind(struct usb_composite_dev *cdev)
+ 		device_desc.bcdDevice = __constant_cpu_to_le16(0x9999);
+ 	}
+ 
++	/* TEST: premature pullup to check if PHY is electrically working */
+ 	debug("%s: calling usb_gadget_connect for "
+ 			"controller '%s'\n", __func__, gadget->name);
+ 	usb_gadget_connect(gadget);
+diff --git a/dts/upstream/src/arm64/exynos/exynos7885-galaxy-a40.dts b/dts/upstream/src/arm64/exynos/exynos7885-galaxy-a40.dts
+new file mode 100644
+index 00000000000..434e3f65a0b
+--- /dev/null
++++ b/dts/upstream/src/arm64/exynos/exynos7885-galaxy-a40.dts
+@@ -0,0 +1,138 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Samsung Galaxy A40 (SM-A405) device tree source
++ *
++ * Exynos 7904, handled as the Exynos 7885 family.
++ *
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ */
++
++/dts-v1/;
++#include "exynos7885.dtsi"
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/interrupt-controller/arm-gic.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++
++/ {
++	model = "Samsung Galaxy A40";
++	compatible = "samsung,a40", "samsung,exynos7885";
++	chassis-type = "handset";
++
++	aliases {
++		mmc0 = &mmc_0;
++		serial0 = &serial_0;
++		serial1 = &serial_1;
++		serial2 = &serial_2;
++	};
++
++	/*
++	 * S-BOOT populates the live banks; these match the downstream A40
++	 * map (3.5 GB low + 2 GB high, same layout as jackpotlte).
++	 */
++	memory@80000000 {
++		device_type = "memory";
++		reg = <0x0 0x80000000 0x3da00000>,
++		      <0x0 0xc0000000 0x40000000>,
++		      <0x8 0x80000000 0x80000000>;
++	};
++
++	/*
++	 * Pseudo reference clock for the USB DRD PHY.  The PHY driver calls
++	 * clk_get_rate("ref") only to determine the FSEL encoding; the actual
++	 * USB PLL is already locked by S-Boot and is not modelled in U-Boot's
++	 * clock driver.  S-Boot programs the PHY with FSEL=7 (SSPPLLCTL[2:0]=7),
++	 * i.e. a 50 MHz reference clock — confirmed by reading the pristine
++	 * SSPPLLCTL (0x60108887) before re-init.  Provide 50 MHz here so the
++	 * driver selects FSEL=7 to match; forcing 26 MHz left the PHY PLL
++	 * mistuned and the link stuck in USBLNKST=Disconnected.
++	 */
++	usbdrd_phy_ref: clock-usbdrd-phy-ref {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <50000000>;
++	};
++
++	gpio-keys {
++		compatible = "gpio-keys";
++		pinctrl-names = "default";
++		pinctrl-0 = <&key_power &key_voldown &key_volup>;
++
++		key-power {
++			label = "Power";
++			gpios = <&gpa1 7 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_POWER>;
++		};
++		key-voldown {
++			label = "Volume Down";
++			gpios = <&gpa1 6 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_VOLUMEDOWN>;
++		};
++		key-volup {
++			label = "Volume Up";
++			gpios = <&gpa1 5 GPIO_ACTIVE_LOW>;
++			linux,code = <KEY_VOLUMEUP>;
++		};
++	};
++};
++
++&oscclk {
++	clock-frequency = <26000000>;
++};
++
++&soc {
++	usbdrd: usb@13600000 {
++		compatible = "samsung,exynos7885-dwusb3";
++		clocks = <&cmu_fsys CLK_FSYS_USB30DRD_BUS_CLK_EARLY>,
++			 <&cmu_fsys CLK_FSYS_USB30DRD_REF_CLK>;
++		clock-names = "bus_early", "ref";
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges = <0x0 0x13600000 0x10000>;
++		status = "okay";
++
++		usbdrd_dwc3: usb@0 {
++			compatible = "snps,dwc3";
++			reg = <0x0 0x10000>;
++			interrupts = <GIC_SPI 135 IRQ_TYPE_LEVEL_HIGH>;
++			phys = <&usbdrd_phy 0>;
++			phy-names = "usb2-phy";
++			phy_type = "utmi";
++			dr_mode = "peripheral";
++			maximum-speed = "high-speed";
++			snps,quirk-frame-length-adjustment = <0x20>;
++		};
++	};
++
++	usbdrd_phy: phy@135d0000 {
++		compatible = "samsung,exynos7885-usbdrd-phy";
++		reg = <0x135d0000 0x100>;
++		clocks = <&cmu_fsys CLK_FSYS_USB30DRD_ACLK_20PHYCTRL>,
++			 <&usbdrd_phy_ref>;
++		clock-names = "phy", "ref";
++		samsung,pmu-syscon = <&pmu_system_controller>;
++		#phy-cells = <1>;
++		status = "okay";
++	};
++};
++
++&pinctrl_alive {
++	key_power: key-power-pins {
++		samsung,pins = "gpa1-7";
++		samsung,pin-function = <0xf>;	/* EINT */
++		samsung,pin-pud = <0>;		/* no pull */
++		samsung,pin-drv = <0>;
++	};
++	key_voldown: key-voldown-pins {
++		samsung,pins = "gpa1-6";
++		samsung,pin-function = <0xf>;
++		samsung,pin-pud = <0>;
++		samsung,pin-drv = <0>;
++	};
++	key_volup: key-volup-pins {
++		samsung,pins = "gpa1-5";
++		samsung,pin-function = <0xf>;
++		samsung,pin-pud = <0>;
++		samsung,pin-drv = <0>;
++	};
++};
+-- 
+2.47.3
+

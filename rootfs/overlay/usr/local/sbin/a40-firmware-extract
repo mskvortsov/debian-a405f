@@ -1,0 +1,133 @@
+#!/bin/sh
+# Copy the firmware this phone's drivers need out of its own stock
+# Android partitions, which flashing Debian to userdata leaves in place:
+#
+#   vendor (/etc/wifi)  mx140.bin, mx140_bt.hcf, mx140_wlan.hcf
+#                       -> /lib/firmware          (WiFi/BT, scsc_mx)
+#   radio               the whole partition
+#                       -> /lib/firmware/samsung/a40/modem.bin
+#   efs                 nv_data.bin
+#                       -> /lib/firmware/samsung/a40/nv_data.bin
+#                       and the shannond RFS sandbox (efs/nv_data.bin,
+#                       efs/root/), with a pristine copy beside it
+#
+# The firmware is not redistributable, and nv_data.bin is per-phone
+# calibration, so nothing of it is in the image. Partitions are only ever
+# read: vendor and efs are mounted read-only without replaying their
+# journals, and radio is read raw.
+#
+# a40-firmware.service runs this once, early on the first boot, before
+# udev loads the drivers. Run it again with --force to redo it; a sandbox
+# that already has files is never overwritten.
+set -eu
+
+STATE=/var/lib/a40-firmware
+FW=/lib/firmware
+MNT=/run/a40-firmware
+
+[ -r /etc/default/shannon ] && . /etc/default/shannon
+SANDBOX=${RFS_SANDBOX:-/var/lib/shannon/rfs}
+
+log() { echo "a40-firmware: $*"; }
+
+if [ -e "$STATE/done" ] && [ "${1:-}" != --force ]; then
+    log "already extracted (--force to redo)"
+    exit 0
+fi
+
+# Partitions by GPT name, from sysfs: this runs before udev has made the
+# /dev/disk/by-partlabel links
+part() {
+    for u in /sys/class/block/mmcblk0p*/uevent; do
+        if grep -qx "PARTNAME=$1" "$u"; then
+            echo "/dev/$(sed -n 's/^DEVNAME=//p' "$u")"
+            return 0
+        fi
+    done
+    return 1
+}
+
+mkdir -p "$STATE" "$FW/samsung/a40" "$MNT"
+failed=0
+
+if dev=$(part vendor); then
+    mkdir -p "$MNT/vendor"
+    if mount -t ext4 -o ro,noload "$dev" "$MNT/vendor"; then
+        for f in mx140.bin mx140_bt.hcf mx140_wlan.hcf; do
+            if [ -f "$MNT/vendor/etc/wifi/$f" ]; then
+                install -m 644 "$MNT/vendor/etc/wifi/$f" "$FW/$f"
+                log "$f from vendor"
+            else
+                log "vendor has no etc/wifi/$f"; failed=1
+            fi
+        done
+        # Only for decoding the WiFi firmware's log; not every build has it
+        ls=$MNT/vendor/etc/wifi/mx140/debug/common/log-strings.bin
+        [ -f "$ls" ] && install -m 644 "$ls" "$FW/log-strings.bin" && log "log-strings.bin from vendor"
+        umount "$MNT/vendor"
+    else
+        log "cannot mount vendor ($dev)"; failed=1
+    fi
+else
+    log "no vendor partition"; failed=1
+fi
+
+if dev=$(part radio); then
+    dd if="$dev" of="$FW/samsung/a40/modem.bin.new" bs=1M status=none
+    chmod 644 "$FW/samsung/a40/modem.bin.new"
+    mv "$FW/samsung/a40/modem.bin.new" "$FW/samsung/a40/modem.bin"
+    log "modem.bin from radio ($dev)"
+else
+    log "no radio partition"; failed=1
+fi
+
+if dev=$(part efs); then
+    mkdir -p "$MNT/efs"
+    if mount -t ext4 -o ro,noload "$dev" "$MNT/efs"; then
+        # A copy of the whole partition: it holds the IMEI and the
+        # calibration, and is what to restore if the original is lost
+        tar -C "$MNT/efs" -cf "$STATE/efs.tar.new" .
+        chmod 600 "$STATE/efs.tar.new"
+        mv "$STATE/efs.tar.new" "$STATE/efs.tar"
+        log "efs backed up to $STATE/efs.tar"
+
+        if [ -f "$MNT/efs/nv_data.bin" ]; then
+            install -m 644 "$MNT/efs/nv_data.bin" "$FW/samsung/a40/nv_data.bin"
+            log "nv_data.bin from efs"
+
+            install -d -m 700 "$SANDBOX"
+            if [ -z "$(ls -A "$SANDBOX")" ]; then
+                for d in efs pristine; do
+                    install -d -m 700 "$SANDBOX/$d"
+                    cp -p "$MNT/efs/nv_data.bin" "$SANDBOX/$d/"
+                    [ -d "$MNT/efs/root" ] && cp -a "$MNT/efs/root" "$SANDBOX/$d/"
+                done
+                install -d -m 700 "$SANDBOX/vendorfs" "$SANDBOX/log"
+                log "RFS sandbox populated in $SANDBOX"
+            else
+                log "$SANDBOX is not empty, left alone"
+            fi
+        else
+            log "efs has no nv_data.bin"; failed=1
+        fi
+        umount "$MNT/efs"
+    else
+        log "cannot mount efs ($dev)"; failed=1
+    fi
+else
+    log "no efs partition"; failed=1
+fi
+
+sync
+
+# Normally nothing has asked for the firmware yet. If the WiFi driver was
+# loaded anyway, reload it so it finds mx140.bin.
+if [ -d /sys/module/scsc_mx ] && [ -f "$FW/mx140.bin" ]; then
+    modprobe -r scsc_mx && modprobe scsc_mx && log "reloaded scsc_mx"
+fi
+
+if [ "$failed" = 0 ]; then
+    touch "$STATE/done"
+else
+    log "incomplete; will retry on the next boot"
+fi

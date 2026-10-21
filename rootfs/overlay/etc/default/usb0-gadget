@@ -1,0 +1,4 @@
+# Settings for usb0-gadget-setup.sh. By default the gadget's MAC
+# addresses are derived from the eMMC CID; set them here to pin them.
+#DEV_ADDR=9e:fe:2b:38:b6:bf
+#HOST_ADDR=92:d5:d2:eb:d6:19

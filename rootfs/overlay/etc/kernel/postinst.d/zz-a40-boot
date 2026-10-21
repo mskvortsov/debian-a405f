@@ -1,0 +1,3 @@
+#!/bin/sh
+# Runs after initramfs-tools has built initrd.img-$1
+exec /usr/local/sbin/a40-boot-install "$1"

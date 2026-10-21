@@ -1,0 +1,79 @@
+name: Build image
+
+# Debian 13 for the Samsung Galaxy A40 (SM-A405F): U-Boot for the boot
+# partition and a btrfs root filesystem for userdata, with the a405f
+# kernel and shannon installed. build.sh does the work, in the container
+# from ./Dockerfile. A pushed tag (e.g. 20261021) publishes a release.
+
+on:
+  push:
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: Kernel branch, tag or commit (mskvortsov/linux-a405f)
+        default: a405f
+      shannon_ref:
+        description: shannon branch, tag or commit (mskvortsov/shannon)
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+      - name: build
+        env:
+          KERNEL_REF: ${{ inputs.kernel_ref || 'a405f' }}
+          SHANNON_REF: ${{ inputs.shannon_ref || 'main' }}
+        run: ./build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: a40-debian
+          path: out/
+          compression-level: 0
+          if-no-files-found: error
+
+  # Boot the image in QEMU and log in as root over SSH
+  test:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: a40-debian
+          path: out
+      - name: install QEMU and sshpass
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-arm \
+            sshpass
+      - name: test
+        run: scripts/test-rootfs.sh out
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [build, test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: a40-debian
+          path: out
+      - name: release
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

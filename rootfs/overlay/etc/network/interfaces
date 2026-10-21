@@ -1,0 +1,15 @@
+# The phone's network link is the USB gadget (usb0-gadget.service). It
+# gets its address by DHCP from whatever is on the other end of the
+# cable: a host sharing its connection, or a router bridging the port
+# into its LAN. The DHCP request carries the hostname. With no DHCP
+# server the link still has an IPv6 link-local address.
+#
+# allow-hotplug, not auto: usb0 is brought up by udev when it appears,
+# in the background, so a boot without a cable does not wait for a
+# lease.
+
+auto lo
+iface lo inet loopback
+
+allow-hotplug usb0
+iface usb0 inet dhcp

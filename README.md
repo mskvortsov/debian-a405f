@@ -19,7 +19,9 @@ and `/boot/dtbs/exynos/exynos7885-a40.dtb` and boots with
 ## What is in the image
 
 - **Kernel**: `linux-image-*` built from `a405f` with `defconfig` +
-  `exynos7870.config` + `exynos7885.config`. Installing a kernel package
+  `exynos7870.config` + `exynos7885.config` from the kernel tree, plus
+  [`kernel/debian.config`](kernel/debian.config) from this repo (WireGuard as a
+  module, IPv4 and IPv6 policy routing). Installing a kernel package
   later makes it the booting one: `/etc/kernel/postinst.d/zz-a40-boot`
   copies it to the fixed names above (decompressing the Image, which
   `booti` needs), and `update-initramfs -u` refreshes `/boot/initramfs`.

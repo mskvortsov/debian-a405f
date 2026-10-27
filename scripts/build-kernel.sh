@@ -5,12 +5,14 @@
 #   scripts/build-kernel.sh SRCDIR OUTDIR
 #
 # The config is the one the a40 runs: defconfig plus the exynos7870 and
-# exynos7885 fragments from the kernel tree, without the git suffix, so
-# the packages are linux-image-7.3.0-exynos7885_20261021_arm64.deb and
-# linux-headers-...: the kernel release, and the build date as the
-# version (KDEB_PKGVERSION overrides it).
+# exynos7885 fragments from the kernel tree and then kernel/debian.config
+# from this repo, without the git suffix, so the packages are
+# linux-image-7.3.0-exynos7885_20261021_arm64.deb and linux-headers-...:
+# the kernel release, and the build date as the version
+# (KDEB_PKGVERSION overrides it).
 set -eu
 
+FRAGMENT=$(cd "$(dirname "$0")"/../kernel && pwd)/debian.config
 SRC=$(cd "$1" && pwd)
 OUT=$(mkdir -p "$2" && cd "$2" && pwd)
 
@@ -25,10 +27,20 @@ export KDEB_PKGVERSION=${KDEB_PKGVERSION:-$(date -u +%Y%m%d)}
 # that is not at a tag gets a "+" appended to the release
 MAKE="make -C $SRC O=$BUILD ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LOCALVERSION="
 $MAKE defconfig exynos7870.config exynos7885.config
+# -m: only merge; olddefconfig below resolves the result
+"$SRC"/scripts/kconfig/merge_config.sh -m -O "$BUILD" "$BUILD"/.config "$FRAGMENT"
 "$SRC"/scripts/config --file "$BUILD"/.config --disable LOCALVERSION_AUTO
 # olddefconfig with the cross compiler: some symbols depend on what the
 # aarch64 toolchain supports
 $MAKE olddefconfig
+# olddefconfig drops what does not meet its dependencies: fail instead
+missing=$(grep -E '^(CONFIG_[A-Za-z0-9_]+=|# CONFIG_[A-Za-z0-9_]+ is not set)' "$FRAGMENT" |
+    grep -vxF -f "$BUILD"/.config || true)
+if [ -n "$missing" ]; then
+    echo "kernel/debian.config: not in the resulting .config:" >&2
+    echo "$missing" >&2
+    exit 1
+fi
 
 # No debug-symbols package
 $MAKE -j"$(nproc)" \
